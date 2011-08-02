@@ -29,7 +29,7 @@ class Exporter(object):
         for i, (c, f) in enumerate(formatters):
             data, row = row[:f.length], row[f.length:]
             values = c.get_formatter_values(data)
-            yield f(values, c)
+            yield f(values, c), is_last
 
     def read(self, concepts=None):
         concepts = concepts or self.concepts

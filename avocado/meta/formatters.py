@@ -1,12 +1,26 @@
-from collections import OrderedDict
+from exceptions import Exception
+try:
+    from collections import OrderedDict
+except ImportError:
+    from ordereddict import OrderedDict
+
 from django.utils.encoding import force_unicode
 from avocado.utils import loader
+from avocado.conf import settings
+DATA_CHOICES_MAP = settings.DATA_CHOICES_MAP
 
-def noop(k, v, d, c, **x): return v
+def noop(k, v, d, p, **x): return v
 
 class Formatter(object):
     """Provides support for the core data formats with sensible defaults
     for handling converting Python datatypes to their formatted equivalent.
+
+    Each core format method must return one of the following:
+        Single formatted Value
+        OrderedDict/sequence of key-value pairs
+
+        If ta format method is unable to do either of these for the given
+        value a FormatException must be raised.
 
         ``values`` - an OrderedDict containing each value along with the field
         instance it represents.
@@ -29,51 +43,49 @@ class Formatter(object):
     """
     name = ''
 
-    def __call__(self, values, concept, choice=None, **context):
+    def __call__(self, values, concept, preferred_formats=None, **context):
+        preferred_formats = preferred_formats or ['raw']
+
         if len(values) == 0:
             raise ValueError, 'no values supplied'
 
-        if choice and choice not in self:
-            raise AttributeError, 'the "%s" formatter is not supported' % choice
-
         out = values.copy()
 
-        method = getattr(self, 'to_%s' % choice, noop)
+        for key, data in values.iteritems():
+            name = data['name']
+            value = data['value']
+            definition = data['definition']
 
-        # the implicit behavior when handling multiple values is to process
-        # them independently since, in most cases, they are not dependent on
-        # on one another, but rather should be represented together since the
-        # data is related. a formatter can be flagged to process all values
-        # together by setting the attribute ``process_multiple=True``. we must
-        # check to if that flag has been set and simply pass through the values
-        # and context to the method as is. if ``process_multiple`` is not set,
-        # each value is handled independently
-        if getattr(method, 'process_multiple', False):
-            data = method(values, concept, **context)
+            fdd = data.copy()
+            for f in preferred_formats:
+                method = getattr(self, 'to_%s' % f, noop)
 
-            # the output of a method that processes multiple values at once
-            # must return an OrderedDict or a sequence of key-value pairs
-            # that can be used to create an OrderedDict.
-            if not isinstance(data, OrderedDict):
-                out.update(data)
+                if getattr(method, 'process_multiple', False):
+                    try:
+                        fdata = self.process_multiple_values(method, values,
+                                concepts, **context)
+                        if not isinstance(fdata, OrderedDict):
+                            out.update(fdata)
+                        else:
+                            out = fdata
+                        return out
+
+                    except Exception:
+                        continue
+                try:
+                    fdata = method(name, value, definition, concept, **context)
+                    break
+                except Exception:
+                    continue
+
+
+            if type(fdata) is dict:
+                fdd.update(fdata)
+            # assume single value 
             else:
-                out = data
-        else:
-            for key, data in values.iteritems():
-                name = data['name']
-                value = data['value']
-                definition = data['definition']
+                fdd['value'] = fdata
 
-                fdd = data.copy()
-                fdata = method(name, value, definition, concept, **context)
-
-                if type(fdata) is dict:
-                    fdd.update(fdata)
-                # assume single value 
-                else:
-                    fdd['value'] = fdata
-
-                out[key] = fdd
+            out[key] = fdd
 
         return out
 
@@ -83,6 +95,18 @@ class Formatter(object):
     def __unicode__(self):
         return u'%s' % self.name
 
+    def process_multiple_values(self, method, values, concept, **context):
+        # the output of a method that process multiple values
+        # must return an OrderedDict or a sequence of key-value
+        # pairs that can be used to create an OrderedDict
+        data = method(values, concept, **context)
+
+        if not isinstance(data, OrderedDict):
+            out.update(data)
+        else:
+            out = data
+        return out
+
     def to_string(self, name, value, definition, concept, **context):
         # attempt to coerce non-strings to strings. depending on the data
         # types that are being passed into this, this may not be good
@@ -91,40 +115,38 @@ class Formatter(object):
             return u''
         return force_unicode(value, strings_only=False)
 
-    to_string.none = u''
+    def to_bool(self, name, value, definition, concept, **context):
+        # if value is native True or False value, return it
+        # Change value to bool if value is a string of false or true
+        if type(value) is bool:
+            return value
+        elif value == "True":
+            value = True
+        elif value == "False":
+            value = False
+        else:
+            raise Exception("Can't Convert to bool")
+        return value
 
-    def to_html(self, values, concept, **context):
-        new_values = []
+    def to_number(self, name, value, definition, concept, **context):
+        # attempts to convert a number. Starting with ints and floats
+        # Eventually create to_decimal using the decimal library.
+        if type(value) is int or is float:
+            return value
+        try: value = int(value)
+        except ValueError, TypeError:
+            value = float(value)
+        return value
 
-        for key, data in values.iteritems():
-            name = data['name']
-            value = data['value']
-            definition = data['definition']
+    def to_coded(self, name, value, definition, concept, **context):
+        # attempts to convert value to its coded representation
+        code_dict = dict(definition.coded_values)
+        value = code_dict[value]
+        return value
 
-            # representing None is HTML needs to be distinct, so we include a
-            # special style for it
-            if value is None:
-                tok = self.none
-
-            # convert bools to their yes/no equivalents 
-            elif type(value) is bool:
-                tok = 'yes' if value else 'no'
-
-            else:
-                tok = self.to_string(name, value, definition, concept, **context)
-
-            new_values.append(tok)
-
-        return OrderedDict({'name': {'name': concept.name,
-            'value': ' '.join(new_values), 'definition': definition}})
-
-    to_html.none = '<span class="no-data">{no data}</span>'
-
-    # this is a sensible default since HTML focuses more on "marking up" the
-    # values with some semantic and/or visual relationship. since HTML has no
-    # notion of a data structure, all values should usually be processed
-    # together
-    to_html.process_multiple = True
+    def to_raw(self, name, value, definition, concept, **context):
+        # returns raw value
+        return value
 
 
 # initialize the registry that will contain all classes for this type of
